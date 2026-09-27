@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -310,6 +311,120 @@ def _resolution_detail_items(resolutions: list[dict]) -> list[dict]:
     return items
 
 
+# ---------------------------------------------------------------------------
+# Shared adjudication commit phase
+#
+# Every state-changing adjudication entry point — explicit resolutions,
+# rule resolutions, historical reuse and draft commits — runs the same
+# commit phase: inside one transaction the merge row is read and guarded
+# (status + revision), a pure in-memory adjudication plan is built, and the
+# single committer persists it (final schema gate, merge update, revision
+# bump, audit event, draft invalidation). A plan that matched nothing is
+# never committed: no write, no revision bump, no audit event.
+# ---------------------------------------------------------------------------
+
+
+def _fetch_merge_row(conn, merge_id: str):
+    """Fetch the merge row inside the caller's transaction.
+
+    Raises MergeNotFound (404) for an unknown merge.
+    """
+    row = conn.execute(
+        "SELECT * FROM merges WHERE id = ?", (merge_id,)
+    ).fetchone()
+    if row is None:
+        raise MergeNotFound(merge_id)
+    return row
+
+
+def _require_pending_at_revision(row, expected_revision: int) -> None:
+    """Guard a fetched merge row before any plan is built.
+
+    Raises AlreadyResolved (409) once the result is final and
+    StaleRevision (409) when the expected revision is not current.
+    """
+    if row["status"] == STATUS_RESOLVED:
+        raise AlreadyResolved(row["id"])
+    if row["revision"] != expected_revision:
+        raise StaleRevision(row["revision"])
+
+
+@dataclass(frozen=True)
+class AdjudicationPlan:
+    """Everything one adjudication batch needs to commit, as pure data.
+
+    Built in memory by an entry point after its matching and validation;
+    constructing the plan writes nothing. ``pointers`` lists the effective
+    pointers in the exact order the audit event records them, ``detail``
+    is the method-specific audit payload, and ``draft_id`` — when set —
+    names the draft the committer invalidates in the same transaction.
+    """
+
+    document: Any
+    remaining: list[dict]
+    pointers: list[str]
+    method: str
+    detail: dict
+    draft_id: str | None = None
+
+
+def _commit_adjudication(
+    conn, merge_id: str, row, plan: AdjudicationPlan
+) -> None:
+    """Persist one adjudication plan inside the caller's transaction.
+
+    The single writer shared by every adjudication entry point: applies
+    the final result-schema gate, updates the merge row (status, document,
+    remaining conflicts, immutable result) with exactly one revision bump,
+    invalidates the draft when the plan carries one, and appends the audit
+    event. Any failure raises, and the caller's transaction rolls the
+    merge update, the draft invalidation and the audit event back together.
+    """
+    resolved = not plan.remaining
+    # Gate: only a batch that resolves the last conflict produces a final
+    # document, so only that batch is validated. A partial batch still
+    # carries conflict placeholders and is committed unchecked.
+    if resolved and row["result_schema"] is not None:
+        validate_result(json.loads(row["result_schema"]), plan.document)
+    now = _now()
+    conn.execute(
+        """
+        UPDATE merges
+        SET status = ?, revision = revision + 1, document = ?,
+            conflicts = ?, result = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        (
+            STATUS_RESOLVED if resolved else STATUS_PENDING,
+            json.dumps(plan.document),
+            json.dumps(plan.remaining),
+            # Once written the result is never updated again: immutable.
+            json.dumps(plan.document) if resolved else None,
+            now,
+            merge_id,
+        ),
+    )
+    if plan.draft_id is not None:
+        # The draft is invalidated in the same transaction as the merge
+        # update that commits its resolutions.
+        conn.execute(
+            "UPDATE merge_drafts SET status = ?, updated_at = ? WHERE id = ?",
+            (DRAFT_COMMITTED, now, plan.draft_id),
+        )
+    # Same transaction as the merge update (and the draft invalidation):
+    # the audit event commits or rolls back together with the state change
+    # it describes.
+    audit.record_event(
+        conn,
+        merge_id,
+        plan.method,
+        row["revision"],
+        row["revision"] + 1,
+        plan.pointers,
+        plan.detail,
+    )
+
+
 def apply_resolutions(
     merge_id: str, expected_revision: int, resolutions: list[dict]
 ) -> dict:
@@ -321,53 +436,20 @@ def apply_resolutions(
     as the merge update; a rejected batch leaves neither.
     """
     with db.transaction() as conn:
-        row = conn.execute(
-            "SELECT * FROM merges WHERE id = ?", (merge_id,)
-        ).fetchone()
-        if row is None:
-            raise MergeNotFound(merge_id)
-        if row["status"] == STATUS_RESOLVED:
-            raise AlreadyResolved(merge_id)
-        if row["revision"] != expected_revision:
-            raise StaleRevision(row["revision"])
+        row = _fetch_merge_row(conn, merge_id)
+        _require_pending_at_revision(row, expected_revision)
 
         document, remaining = _apply_batch(
             json.loads(row["document"]), json.loads(row["conflicts"]), resolutions
         )
-        resolved = not remaining
-        # Gate: only a batch that resolves the last conflict produces a final
-        # document, so only that batch is validated. A partial batch still
-        # carries conflict placeholders and is committed unchecked.
-        if resolved and row["result_schema"] is not None:
-            validate_result(json.loads(row["result_schema"]), document)
-        conn.execute(
-            """
-            UPDATE merges
-            SET status = ?, revision = revision + 1, document = ?,
-                conflicts = ?, result = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (
-                STATUS_RESOLVED if resolved else STATUS_PENDING,
-                json.dumps(document),
-                json.dumps(remaining),
-                # Once written the result is never updated again: immutable.
-                json.dumps(document) if resolved else None,
-                _now(),
-                merge_id,
-            ),
+        plan = AdjudicationPlan(
+            document=document,
+            remaining=remaining,
+            pointers=[item["pointer"] for item in resolutions],
+            method=audit.METHOD_RESOLUTIONS,
+            detail={"items": _resolution_detail_items(resolutions)},
         )
-        # Same transaction as the merge update: the audit event commits or
-        # rolls back together with the state change it describes.
-        audit.record_event(
-            conn,
-            merge_id,
-            audit.METHOD_RESOLUTIONS,
-            row["revision"],
-            row["revision"] + 1,
-            [item["pointer"] for item in resolutions],
-            {"items": _resolution_detail_items(resolutions)},
-        )
+        _commit_adjudication(conn, merge_id, row, plan)
     return get_merge(merge_id)
 
 
@@ -429,15 +511,8 @@ def apply_rule_resolutions(
     nothing and leaves no event.
     """
     with db.transaction() as conn:
-        row = conn.execute(
-            "SELECT * FROM merges WHERE id = ?", (merge_id,)
-        ).fetchone()
-        if row is None:
-            raise MergeNotFound(merge_id)
-        if row["status"] == STATUS_RESOLVED:
-            raise AlreadyResolved(merge_id)
-        if row["revision"] != expected_revision:
-            raise StaleRevision(row["revision"])
+        row = _fetch_merge_row(conn, merge_id)
+        _require_pending_at_revision(row, expected_revision)
 
         # Compiling and planning happens entirely in memory; nothing is
         # touched until every selected conflict has been proven applicable.
@@ -450,40 +525,15 @@ def apply_rule_resolutions(
         applied = False
         if winners:
             document, remaining = apply_plan(json.loads(row["document"]), conflicts, winners)
-            resolved = not remaining
-            # Same gate as explicit resolutions: only the batch that resolves
-            # the very last conflict is checked against the final-result schema.
-            if resolved and row["result_schema"] is not None:
-                validate_result(json.loads(row["result_schema"]), document)
-
-            # Single atomic update: revision increments exactly once.
-            conn.execute(
-                """
-                UPDATE merges
-                SET status = ?, revision = revision + 1, document = ?,
-                    conflicts = ?, result = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    STATUS_RESOLVED if resolved else STATUS_PENDING,
-                    json.dumps(document),
-                    json.dumps(remaining),
-                    json.dumps(document) if resolved else None,
-                    _now(),
-                    merge_id,
-                ),
-            )
             # Winners apply in sorted pointer order (see apply_plan); the
             # event records that same effective order.
             ordered = sorted(winners, key=lambda w: w.pointer)
-            audit.record_event(
-                conn,
-                merge_id,
-                audit.METHOD_RULE_RESOLUTIONS,
-                row["revision"],
-                row["revision"] + 1,
-                [w.pointer for w in ordered],
-                {
+            plan = AdjudicationPlan(
+                document=document,
+                remaining=remaining,
+                pointers=[w.pointer for w in ordered],
+                method=audit.METHOD_RULE_RESOLUTIONS,
+                detail={
                     "items": [
                         {
                             "pointer": w.pointer,
@@ -494,6 +544,7 @@ def apply_rule_resolutions(
                     ]
                 },
             )
+            _commit_adjudication(conn, merge_id, row, plan)
             applied = True
         # Nothing matched: nothing to validate or apply, no state change,
         # no revision bump and no audit event; the unmatched conflicts are
@@ -531,15 +582,8 @@ def reuse_resolutions(
     has no conflict snapshot.
     """
     with db.transaction() as conn:
-        row = conn.execute(
-            "SELECT * FROM merges WHERE id = ?", (merge_id,)
-        ).fetchone()
-        if row is None:
-            raise MergeNotFound(merge_id)
-        if row["status"] == STATUS_RESOLVED:
-            raise AlreadyResolved(merge_id)
-        if row["revision"] != expected_revision:
-            raise StaleRevision(row["revision"])
+        row = _fetch_merge_row(conn, merge_id)
+        _require_pending_at_revision(row, expected_revision)
 
         source_row = conn.execute(
             "SELECT * FROM merges WHERE id = ?", (source_merge_id,)
@@ -582,41 +626,19 @@ def reuse_resolutions(
             document, remaining = _apply_batch(
                 json.loads(row["document"]), target_conflicts, batch
             )
-            resolved = not remaining
-            # Same gate as every other resolving path: only the batch that
-            # closes the last conflict is checked against result_schema.
-            if resolved and row["result_schema"] is not None:
-                validate_result(json.loads(row["result_schema"]), document)
-            conn.execute(
-                """
-                UPDATE merges
-                SET status = ?, revision = revision + 1, document = ?,
-                    conflicts = ?, result = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    STATUS_RESOLVED if resolved else STATUS_PENDING,
-                    json.dumps(document),
-                    json.dumps(remaining),
-                    json.dumps(document) if resolved else None,
-                    _now(),
-                    merge_id,
-                ),
-            )
-            # Same transaction as the merge update; a zero-match reuse
-            # reaches no UPDATE and therefore records no event.
-            audit.record_event(
-                conn,
-                merge_id,
-                audit.METHOD_REUSE_RESOLUTIONS,
-                row["revision"],
-                row["revision"] + 1,
-                [match.pointer for match in matches],
-                {
+            plan = AdjudicationPlan(
+                document=document,
+                remaining=remaining,
+                pointers=[match.pointer for match in matches],
+                method=audit.METHOD_REUSE_RESOLUTIONS,
+                detail={
                     "source_merge_id": source_merge_id,
                     "items": [match_to_view(match) for match in matches],
                 },
             )
+            # A zero-match reuse never reaches the committer and therefore
+            # records no event.
+            _commit_adjudication(conn, merge_id, row, plan)
             applied = True
 
     view = get_merge(merge_id)
@@ -812,11 +834,7 @@ def commit_draft(merge_id: str, draft_id: str) -> dict:
     applied with exactly one revision bump and the draft is invalidated.
     """
     with db.transaction() as conn:
-        merge_row = conn.execute(
-            "SELECT * FROM merges WHERE id = ?", (merge_id,)
-        ).fetchone()
-        if merge_row is None:
-            raise MergeNotFound(merge_id)
+        merge_row = _fetch_merge_row(conn, merge_id)
         draft_row = conn.execute(
             "SELECT * FROM merge_drafts WHERE id = ?", (draft_id,)
         ).fetchone()
@@ -824,10 +842,7 @@ def commit_draft(merge_id: str, draft_id: str) -> dict:
             raise DraftNotFound(draft_id)
         if draft_row["status"] != DRAFT_OPEN:
             raise DraftNotOpen(draft_id)
-        if merge_row["status"] == STATUS_RESOLVED:
-            raise AlreadyResolved(merge_id)
-        if merge_row["revision"] != draft_row["base_revision"]:
-            raise StaleRevision(merge_row["revision"])
+        _require_pending_at_revision(merge_row, draft_row["base_revision"])
 
         conflicts = json.loads(merge_row["conflicts"])
         open_pointers = {c["pointer"] for c in conflicts}
@@ -842,47 +857,20 @@ def commit_draft(merge_id: str, draft_id: str) -> dict:
         document, remaining = _apply_batch(
             json.loads(merge_row["document"]), conflicts, _stored_to_batch(stored)
         )
-        resolved = not remaining
-        # Same gate as resolution batches: only the commit that resolves
-        # the last conflict is checked against the final-result schema.
-        if resolved and merge_row["result_schema"] is not None:
-            validate_result(json.loads(merge_row["result_schema"]), document)
-
-        now = _now()
-        conn.execute(
-            """
-            UPDATE merges
-            SET status = ?, revision = revision + 1, document = ?,
-                conflicts = ?, result = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            (
-                STATUS_RESOLVED if resolved else STATUS_PENDING,
-                json.dumps(document),
-                json.dumps(remaining),
-                # Once written the result is never updated again: immutable.
-                json.dumps(document) if resolved else None,
-                now,
-                merge_id,
-            ),
-        )
-        conn.execute(
-            "UPDATE merge_drafts SET status = ?, updated_at = ? WHERE id = ?",
-            (DRAFT_COMMITTED, now, draft_id),
-        )
-        # Same transaction as the merge update and the draft invalidation.
-        audit.record_event(
-            conn,
-            merge_id,
-            audit.METHOD_DRAFT_COMMIT,
-            merge_row["revision"],
-            merge_row["revision"] + 1,
-            list(stored.keys()),
-            {
+        plan = AdjudicationPlan(
+            document=document,
+            remaining=remaining,
+            pointers=list(stored.keys()),
+            method=audit.METHOD_DRAFT_COMMIT,
+            detail={
                 "draft_id": draft_id,
                 "items": _resolution_detail_items(_stored_to_batch(stored)),
             },
+            draft_id=draft_id,
         )
+        # Commits the merge update, the draft invalidation and the audit
+        # event together; any failure rolls all three back.
+        _commit_adjudication(conn, merge_id, merge_row, plan)
     view = get_merge(merge_id)
     view["draft_id"] = draft_id
     return view
